@@ -1,6 +1,6 @@
 # Apache Superset Docker Setup
 
-This repository contains a production-ready Docker setup for Apache Superset with support for both development and production deployments.
+This repository contains a production-ready Docker setup for Apache Superset v5.0.0 with support for both development and production deployments.
 
 ## Features
 
@@ -259,6 +259,28 @@ docker compose restart
 docker compose restart superset
 ```
 
+### Health Checks
+
+All services include built-in health checks for monitoring:
+
+```bash
+# Check Superset health
+curl http://localhost/health
+
+# Check Redis health (from within container)
+docker compose exec redis redis-cli ping
+
+# View service health status
+docker compose ps
+```
+
+Health check endpoints:
+- **Superset**: `http://localhost:8088/health` (returns 200 OK when healthy)
+- **Redis**: `redis-cli ping` (returns PONG when healthy)
+- **Nginx**: `http://localhost/health` (proxies to Superset health check)
+
+Docker Compose uses `condition: service_healthy` to ensure proper startup order.
+
 ---
 
 ## Environment Variables
@@ -370,6 +392,7 @@ docker compose restart superset
 | `superset_config.py` | Superset application configuration |
 | `.env` | Environment variables (create from .env.example) |
 | `.gitignore` | Git ignore rules |
+| `CLAUDE.md` | Project instructions for Claude Code AI assistant |
 
 ---
 
