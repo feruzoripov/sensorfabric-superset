@@ -1,6 +1,7 @@
 from urllib.parse import quote_plus
 from sensorfabric.mdh import MDH
 from sensorfabric import utils
+import re
 import os
 from datetime import datetime, timezone
 import base64
@@ -204,3 +205,52 @@ file_handler = RotatingFileHandler(
 )
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+# Tables you want to block (case-insensitive).
+BLOCKED_TABLES = {
+    "allparticipants",
+}
+
+# This matches quoted or unquoted identifiers, with or without schema,
+# and respects word boundaries so 'secret_table_bak' won't trigger.
+def _compile_block_patterns(blocked=set()):
+    pats = []
+    for name in blocked:
+        parts = name.split(".")
+        if len(parts) == 2:
+            schema, table = map(re.escape, parts)
+            pat = rf'(?i)(?<![\w"])("?\b{schema}\b"?\s*\.\s*"?\b{table}\b"?)'
+        else:
+            table = re.escape(parts[0])
+            pat = rf'(?i)(?<![\w"])("?\b{table}\b"?)'
+        pats.append(re.compile(pat))
+    return pats
+
+_BLOCK_PATTERNS = _compile_block_patterns(BLOCKED_TABLES)
+
+def _strip_sql_comments(sql):
+    # Remove /* ... */ and -- ... comments to avoid false positives in comments
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+def SQL_QUERY_MUTATOR(sql, **kwargs):
+    """
+    If the SQL references a blocked table, raise an error and prevent execution.
+    Otherwise, prefix the SQL with a comment (optional) and pass it through.
+    """
+    cleaned = _strip_sql_comments(sql)
+
+    # Look for any blocked table patterns
+    for pat in _BLOCK_PATTERNS:
+        if pat.search(cleaned):
+            # Raise an exception to stop SQL Lab from running this query
+            raise Exception(
+                "This query references a restricted table and cannot be executed. "
+                "If you believe you need access, contact the data admin."
+            )
+
+    dttm = datetime.now().isoformat()
+    return f"-- [SQL LAB] {dttm}\n{sql}"
+
+SQL_QUERY_MUTATOR = SQL_QUERY_MUTATOR
