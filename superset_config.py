@@ -1,6 +1,7 @@
 from urllib.parse import quote_plus
 from sensorfabric.mdh import MDH
 from sensorfabric import utils
+import re
 import os
 from datetime import datetime, timezone
 import base64
@@ -192,13 +193,11 @@ DB_CONNECTION_MUTATOR = custom_db_connector_mutator
 # ========================================
 
 ROW_LIMIT = 100000
-PREFERRED_DATABASES = [
-    'Amazon Athena'
-]
+PREFERRED_DATABASES = ["Amazon Athena"]
 
-SECRET_KEY=os.environ.get('SECRET_KEY')
+SECRET_KEY = os.environ.get("SECRET_KEY")
 if SECRET_KEY is None:
-    raise Exception('SECRET_KEY environment variable not set')
+    raise Exception("SECRET_KEY environment variable not set")
 
 # ========================================
 # Redis Configuration
@@ -276,7 +275,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # Create logs directory if it doesn't exist
-log_dir = os.path.join(os.environ.get('SUPERSET_HOME', '/app/superset_home'), 'logs')
+log_dir = os.path.join(os.environ.get("SUPERSET_HOME", "/app/superset_home"), "logs")
 os.makedirs(log_dir, exist_ok=True)
 
 ENABLE_PROXY_FIX = True
@@ -287,9 +286,59 @@ LOG_FORMAT = "%(asctime)s:%(levelname)s:%(name)s:%(message)s"
 
 # File handler for application logs
 file_handler = RotatingFileHandler(
-    os.path.join(log_dir, 'superset.log'),
-    maxBytes=10485760,  # 10MB
-    backupCount=10
+    os.path.join(log_dir, "superset.log"), maxBytes=10485760, backupCount=10  # 10MB
 )
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+# ---- Read blocked tables from env ----
+# Example in .env:
+# BLOCKED_TABLES=raw.pii_users, finance.payments_ledger, secret_table
+BLOCKED_TABLES = {
+    t.strip()
+    for t in os.getenv("BLOCKED_TABLES", "").split(",")
+    if t.strip()
+}
+
+def _compile_block_patterns(blocked: set[str]) -> list[re.Pattern]:
+    """
+    Compile regexes that match quoted/unquoted, schema-qualified or plain names.
+    """
+    patterns: list[re.Pattern] = []
+    for name in blocked:
+        parts = name.split(".")
+        if len(parts) == 2:
+            schema, table = map(re.escape, parts)
+            # e.g. raw.pii_users (with optional quotes/whitespace)
+            pat = rf'(?i)(?<![\w"])("?\b{schema}\b"?\s*\.\s*"?\b{table}\b"?)'
+        else:
+            table = re.escape(parts[0])
+            pat = rf'(?i)(?<![\w"])("?\b{table}\b"?)'
+        patterns.append(re.compile(pat))
+    return patterns
+
+_BLOCK_PATTERNS = _compile_block_patterns(BLOCKED_TABLES)
+
+def _strip_sql_comments(sql: str) -> str:
+    # Remove /* ... */ and -- ... to avoid matches in comments
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
+    """
+    Blocks queries that reference any table in BLOCKED_TABLES.
+    """
+    cleaned = _strip_sql_comments(sql)
+
+    for pat in _BLOCK_PATTERNS:
+        if pat.search(cleaned):
+            raise Exception(
+                "This query references a restricted table and cannot be executed. "
+                "If you believe you need access, contact the data admin."
+            )
+
+    dttm = datetime.now().isoformat()
+    return f"-- [SQL LAB] {dttm}\n{sql}"
+
+SQL_QUERY_MUTATOR = SQL_QUERY_MUTATOR
