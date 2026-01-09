@@ -1,6 +1,7 @@
 from urllib.parse import quote_plus
 from sensorfabric.mdh import MDH
 from sensorfabric import utils
+import re
 import os
 from datetime import datetime, timezone
 import base64
@@ -216,3 +217,55 @@ file_handler = RotatingFileHandler(
 )
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+
+# ---- Read blocked tables from env ----
+# Example in .env:
+# BLOCKED_TABLES=raw.pii_users, finance.payments_ledger, secret_table
+BLOCKED_TABLES = {
+    t.strip()
+    for t in os.getenv("BLOCKED_TABLES", "").split(",")
+    if t.strip()
+}
+
+def _compile_block_patterns(blocked: set[str]) -> list[re.Pattern]:
+    """
+    Compile regexes that match quoted/unquoted, schema-qualified or plain names.
+    """
+    patterns: list[re.Pattern] = []
+    for name in blocked:
+        parts = name.split(".")
+        if len(parts) == 2:
+            schema, table = map(re.escape, parts)
+            # e.g. raw.pii_users (with optional quotes/whitespace)
+            pat = rf'(?i)(?<![\w"])("?\b{schema}\b"?\s*\.\s*"?\b{table}\b"?)'
+        else:
+            table = re.escape(parts[0])
+            pat = rf'(?i)(?<![\w"])("?\b{table}\b"?)'
+        patterns.append(re.compile(pat))
+    return patterns
+
+_BLOCK_PATTERNS = _compile_block_patterns(BLOCKED_TABLES)
+
+def _strip_sql_comments(sql: str) -> str:
+    # Remove /* ... */ and -- ... to avoid matches in comments
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
+    """
+    Blocks queries that reference any table in BLOCKED_TABLES.
+    """
+    cleaned = _strip_sql_comments(sql)
+
+    for pat in _BLOCK_PATTERNS:
+        if pat.search(cleaned):
+            raise Exception(
+                "This query references a restricted table and cannot be executed. "
+                "If you believe you need access, contact the data admin."
+            )
+
+    dttm = datetime.now().isoformat()
+    return f"-- [SQL LAB] {dttm}\n{sql}"
+
+SQL_QUERY_MUTATOR = SQL_QUERY_MUTATOR
