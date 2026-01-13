@@ -9,7 +9,7 @@ This repository contains a production-ready Docker setup for Apache Superset v5.
 - 💾 **Redis Caching**: Distributed caching for improved performance
 - 🔒 **Security**: Configured with security headers and best practices
 - 🛠️ **Development Mode**: Lightweight standalone container for testing
-- 📊 **MDH Integration**: Optional integration with MDH Data Explorer
+- 📊 **Multi-Project MDH Integration**: Support for multiple MDH Data Explorer projects
 
 ## Prerequisites
 
@@ -325,8 +325,13 @@ Docker Compose uses `condition: service_healthy` to ensure proper startup order.
 |----------|-------------|---------|
 | `LOG_LEVEL` | Application log level | INFO |
 
-### MDH Configuration (Optional)
+### Multi-Project MDH Configuration
 
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `MDH_PROJECTS` | JSON array of MDH project configurations | No |
+
+**Single Project (Legacy):**
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `MDH_SECRET` | Base64 encoded MDH secret key | No |
@@ -335,7 +340,7 @@ Docker Compose uses `condition: service_healthy` to ensure proper startup order.
 | `MDH_SCHEMA` | MDH schema name | No |
 | `MDH_S3` | MDH S3 output location | No |
 
-**Note:** All MDH variables must be set to enable MDH integration mode.
+**Note:** Use either `MDH_PROJECTS` for multiple projects or individual variables for single project.
 
 ---
 
@@ -389,7 +394,8 @@ Docker Compose uses `condition: service_healthy` to ensure proper startup order.
 | `entry.sh` | Container entrypoint script |
 | `gunicorn_config.py` | Gunicorn WSGI server configuration |
 | `nginx.conf` | Nginx reverse proxy configuration |
-| `superset_config.py` | Superset application configuration |
+| `superset_config.py` | Superset application configuration with multi-project MDH support |
+| `mdh_projects.yaml` | Optional YAML configuration for MDH projects |
 | `.env` | Environment variables (create from .env.example) |
 | `.gitignore` | Git ignore rules |
 | `CLAUDE.md` | Project instructions for Claude Code AI assistant |
@@ -546,34 +552,122 @@ volumes:
 
 ---
 
-## MDH Integration
+## Multi-Project MDH Integration
 
-This setup includes optional integration with MDH Data Explorer for AWS Athena queries.
+This setup supports multiple MDH Data Explorer projects simultaneously, allowing you to connect to different MDH environments from a single Superset instance.
 
-### Setup
+### Configuration Methods
 
-1. Obtain MDH service account credentials
-2. Base64 encode your secret key:
+#### Method 1: JSON Configuration (Recommended)
+
+Configure multiple projects in your `.env` file using JSON format:
+
+```env
+MDH_PROJECTS=[
+  {
+    "alias": "production",
+    "account_secret_b64": "LS0tLS1CRUdJTi...",
+    "account_name": "MyDataHelps.PROD.user",
+    "project_id": "prod-project-uuid",
+    "schema_name": "prod_schema",
+    "s3_output": "s3://prod-bucket/athena-results/"
+  },
+  {
+    "alias": "staging", 
+    "account_secret_b64": "LS0tLS1CRUdJTi...",
+    "account_name": "MyDataHelps.STAGING.user",
+    "project_id": "staging-project-uuid",
+    "schema_name": "staging_schema",
+    "s3_output": "s3://staging-bucket/athena-results/"
+  }
+]
+```
+
+#### Method 2: YAML Configuration
+
+Alternatively, create a `mdh_projects.yaml` file:
+
+```yaml
+projects:
+  production:
+    account_name: "MyDataHelps.PROD.user"
+    secret: "LS0tLS1CRUdJTi..."  # Base64 encoded private key
+    project_id: "prod-project-uuid"
+    schema: "prod_schema"
+    s3_output: "s3://prod-bucket/athena-results/"
+    region: "us-east-1"
+    
+  staging:
+    account_name: "MyDataHelps.STAGING.user"
+    secret: "LS0tLS1CRUdJTi..."
+    project_id: "staging-project-uuid"
+    schema: "staging_schema"
+    s3_output: "s3://staging-bucket/athena-results/"
+    region: "us-west-2"
+```
+
+### Setup Steps
+
+1. **Obtain MDH Credentials**: Get service account credentials for each project
+2. **Encode Secret Keys**:
    ```bash
-   cat your_secret_key.pem | base64
+   cat your_private_key.pem | base64 -w 0
    ```
-3. Configure in `.env`:
-   ```env
-   MDH_SECRET=<base64_encoded_secret>
-   MDH_ACC_NAME=your_account_name
-   MDH_PROJECT_ID=your_project_id
-   MDH_SCHEMA=your_schema
-   MDH_S3=s3://your-bucket/path/
+3. **Configure Projects**: Use either JSON in `.env` or YAML file
+4. **Restart Superset**:
+   ```bash
+   ./up.sh --build
    ```
 
-### Usage
+### Creating Database Connections
 
-When MDH variables are set, Superset will:
-- Automatically connect to MDH Data Explorer
-- Fetch temporary AWS credentials
-- Enable Amazon Athena as a data source
+In Superset UI (Settings → Database Connections), create connections using these hostname patterns:
 
-Connection URL format: `mdh.athena.com`
+| Project | Database Host | Description |
+|---------|---------------|-------------|
+| production | `mdh-production` | Production MDH project |
+| staging | `mdh-staging` | Staging MDH project |
+| analytics | `mdh-analytics` | Analytics MDH project |
+
+### Project Detection
+
+The system automatically detects which MDH project to use based on:
+
+1. **Query Parameter**: `?mdh_project=production`
+2. **Hostname Pattern**: `mdh-production`, `mdh.production.athena.com`
+3. **Single Project Fallback**: If only one project configured
+
+### Configuration Fields
+
+**Required Fields:**
+- `account_name` / `account_secret_b64` (JSON) or `secret` (YAML)
+- `project_id`: MDH project UUID
+
+**Optional Fields:**
+- `schema` / `schema_name`: Database schema
+- `s3_output`: S3 location for Athena results
+- `region`: AWS region (default: us-east-1)
+- `workgroup`: Athena workgroup (default: mdh_export_database_external_prod)
+- `catalog`: Glue catalog (default: AwsDataCatalog)
+
+### Legacy Single Project Support
+
+For backward compatibility, you can still use individual environment variables:
+
+```env
+MDH_SECRET=<base64_encoded_secret>
+MDH_ACC_NAME=your_account_name
+MDH_PROJECT_ID=your_project_id
+MDH_SCHEMA=your_schema
+MDH_S3=s3://your-bucket/path/
+```
+
+### How It Works
+
+1. **Automatic Credential Management**: Each project maintains its own AWS credentials
+2. **Credential Refresh**: Expired credentials are automatically refreshed
+3. **Project Isolation**: Each project operates independently
+4. **Seamless Integration**: Works transparently with existing Superset features
 
 ---
 
