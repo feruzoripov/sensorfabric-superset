@@ -5,83 +5,192 @@ import re
 import os
 from datetime import datetime, timezone
 import base64
+import yaml
+from cachelib.redis import RedisCache
 
-# Will store global keys for connecting directly with MDH Data Explorer.
-MDH_dataExplorer = {
-    "AccessKeyId": "",
-    "SecretAccessKey": "",
-    "SessionToken": "",
-    "Expiration": "",
-    "region": "us-east-1",
-    "catalog": "AwsDataCatalog",
-    "schema_name": "",
-    "workgroup": "mdh_export_database_external_prod",
-    "s3_output": "",
-}
+# ========================================
+# Multi-Project MDH Configuration
+# ========================================
 
-# Holds details about MDH service account credentials.
-secret_key = None
-service_account = None
-project_id = None
+MDH_PROJECTS = {}
 
+class MDHProject:
+    def __init__(self, project_alias, config):
+        self.alias = project_alias
+        self.project_id = config.get('project_id', project_alias)
+        self.account_name = config['account_name']
 
-def getExplorerCredentials(secret_key, service_account, project_id):
-    """
-    Get the temporary AWS explorer credentials from AWS.
-    These only last for a certain amount of time before they expire.
-    """
-    global MDH_dataExplorer  # We are going to make changes to this.
+        # Handle secret key - support both field names
+        secret_value = config.get('secret') or config.get('account_secret_b64')
+        if not secret_value:
+            raise ValueError(f"No secret key found for project {project_alias}")
 
-    mdh = MDH(
-        account_secret=secret_key, account_name=service_account, project_id=project_id
-    )
-    token = mdh.genServiceToken()
+        # Decode base64 secret to bytes
+        self.secret_key = base64.b64decode(secret_value)
 
-    dataExplorer = mdh.getExplorerCreds()
+        self.schema = config.get('schema') or config.get('schema_name', '')
+        self.s3_output = config.get('s3_output', '')
+        self.region = config.get('region', 'us-east-1')
+        self.workgroup = config.get('workgroup', 'mdh_export_database_external_prod')
+        self.catalog = config.get('catalog', 'AwsDataCatalog')
 
-    # Populate the global MDH explorer credentials.
-    for key in dataExplorer.keys():
-        if key in MDH_dataExplorer:
-            MDH_dataExplorer[key] = dataExplorer[key]
+        # Credentials storage
+        self.credentials = {
+            'AccessKeyId': '',
+            'SecretAccessKey': '',
+            'SessionToken': '',
+            'Expiration': '1970-01-01T00:00:00+00:00',
+            'region': self.region,
+            'catalog': self.catalog,
+            'schema_name': self.schema,
+            'workgroup': self.workgroup,
+            's3_output': self.s3_output
+        }
 
-    print(
-        f"New explorer credentials have been generated. Will expire on - {MDH_dataExplorer['Expiration']}"
-    )
+    def _credentials_expired(self):
+        """Check if current credentials are expired"""
+        try:
+            exp_time = datetime.fromisoformat(self.credentials['Expiration'])
+            return datetime.now(timezone.utc) >= exp_time
+        except:
+            return True
 
+    def _refresh_credentials(self):
+        """Get fresh credentials from MDH"""
+        mdh = MDH(
+            account_secret=self.secret_key,
+            account_name=self.account_name,
+            project_id=self.project_id
+        )
 
-def custom_db_connector_mutator(uri, params, username, security_manager, source):
-    global MDH_dataExplorer
+        token = mdh.genServiceToken()
+        dataExplorer = mdh.getExplorerCreds()
 
-    # We only update the sql alchemy parameters
-    if not uri.host == "mdh.athena.com":
+        # Update credentials
+        for key in dataExplorer.keys():
+            if key in self.credentials:
+                self.credentials[key] = dataExplorer[key]
+
+    def get_connection_params(self):
+        """Get SQLAlchemy URI and connection parameters"""
+        if self._credentials_expired():
+            self._refresh_credentials()
+
+        # Build URI
+        uri = (
+            f"awsathena+rest://"
+            f"athena.{self.credentials['region']}.amazonaws.com:443/{self.credentials['schema_name']}"
+            f"?s3_staging_dir={quote_plus(self.credentials['s3_output'])}&work_group={self.credentials['workgroup']}"
+        )
+
+        params = {
+            "connect_args": {
+                "catalog_name": self.credentials['catalog'],
+                "aws_access_key_id": self.credentials['AccessKeyId'],
+                "aws_secret_access_key": self.credentials['SecretAccessKey'],
+                "aws_session_token": self.credentials['SessionToken']
+            }
+        }
+
         return uri, params
 
-    # Do a quick check to make sure that the credentials have not expired.
-    expireUTC = datetime.fromisoformat(MDH_dataExplorer["Expiration"])
-    nowUTC = datetime.now(timezone.utc)
-    if nowUTC > expireUTC:
-        getExplorerCredentials(secret_key, service_account, project_id)
+def load_mdh_projects():
+    """Load MDH projects from environment variables or YAML"""
+    global MDH_PROJECTS
 
-    # Rewrite the SQLALCHEMY_DATABASE_URI here if needed for mdh specific injections.
-    uri = (
-        f"awsathena+rest://"
-        f"athena.{MDH_dataExplorer['region']}.amazonaws.com:443/{MDH_dataExplorer['schema_name']}"
-        f"?s3_staging_dir={quote_plus(MDH_dataExplorer['s3_output'])}&work_group={MDH_dataExplorer['workgroup']}"
-    )
+    # Try JSON from environment variable first
+    projects_env = os.getenv('MDH_PROJECTS')
+    if projects_env:
+        try:
+            import json
+            projects_config = json.loads(projects_env)
+            
+            for project_config in projects_config:
+                project_alias = project_config.get('alias')
+                if project_alias:
+                    try:
+                        project = MDHProject(project_alias, project_config)
+                        MDH_PROJECTS[project_alias] = project
+                    except Exception:
+                        continue
+            return
+        except Exception:
+            pass
 
-    params = {
-        "connect_args": {
-            "catalog_name": MDH_dataExplorer["catalog"],
-            "aws_access_key_id": MDH_dataExplorer["AccessKeyId"],
-            "aws_secret_access_key": MDH_dataExplorer["SecretAccessKey"],
-            "aws_session_token": MDH_dataExplorer["SessionToken"],
-        }
-    }
+    # Try YAML configuration file
+    config_file = os.getenv('MDH_CONFIG_FILE', 'mdh_projects.yaml')
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            if config and 'projects' in config:
+                for project_alias, project_config in config['projects'].items():
+                    if project_config.get('account_name') and project_config.get('secret'):
+                        try:
+                            project = MDHProject(project_alias, project_config)
+                            MDH_PROJECTS[project_alias] = project
+                        except Exception:
+                            continue
+        except Exception:
+            pass
 
-    return uri, params
+def get_project_from_uri(uri_str):
+    """Extract project ID from database URI"""
+    # Check for query parameter
+    if '?mdh_project=' in uri_str:
+        try:
+            return uri_str.split('?mdh_project=')[1].split('&')[0]
+        except:
+            pass
 
+    # Check hostname patterns
+    if 'mdh-' in uri_str:
+        try:
+            start = uri_str.find('mdh-') + 4
+            end_markers = ['.', ':', '/', '?']
+            end = len(uri_str)
+            for marker in end_markers:
+                marker_pos = uri_str.find(marker, start)
+                if marker_pos != -1:
+                    end = min(end, marker_pos)
+            return uri_str[start:end]
+        except:
+            pass
+
+    # Check if URI contains any configured project names
+    for project_alias in MDH_PROJECTS.keys():
+        if project_alias in uri_str:
+            return project_alias
+
+    # If only one project configured, use it
+    if len(MDH_PROJECTS) == 1:
+        return list(MDH_PROJECTS.keys())[0]
+
+    return None
+
+def custom_db_connector_mutator(uri, params, username, security_manager, source):
+    """Multi-project MDH database connector mutator"""
+    uri_str = str(uri)
+    project_alias = get_project_from_uri(uri_str)
+
+    if not project_alias or project_alias not in MDH_PROJECTS:
+        return uri, params
+
+    # Get connection parameters from the project
+    project = MDH_PROJECTS[project_alias]
+    new_uri, new_params = project.get_connection_params()
+
+    return new_uri, new_params
+
+# Initialize MDH projects
+load_mdh_projects()
 
 DB_CONNECTION_MUTATOR = custom_db_connector_mutator
+
+# ========================================
+# Superset Configuration
+# ========================================
 
 ROW_LIMIT = 100000
 PREFERRED_DATABASES = ["Amazon Athena"]
@@ -90,47 +199,11 @@ SECRET_KEY = os.environ.get("SECRET_KEY")
 if SECRET_KEY is None:
     raise Exception("SECRET_KEY environment variable not set")
 
-# If the MDH_SECRET envrionment variable has been set then we put superset in MDH
-# connect mode.
-if (
-    os.getenv("MDH_SECRET")
-    and os.getenv("MDH_ACC_NAME")
-    and os.getenv("MDH_PROJECT_ID")
-    and os.getenv("MDH_PROJECT_NAME")
-):
-    print("Superset is being put in MDH connect mode.")
-
-    secret_key = os.getenv("MDH_SECRET")
-    # Decode the base64 string into normal multiline string for the key.
-    secret_key = base64.b64decode(secret_key)
-    service_account = os.getenv("MDH_ACC_NAME")
-    project_id = os.getenv("MDH_PROJECT_ID")
-    project_name = os.getenv("MDH_PROJECT_NAME")
-
-    # This sets the global variable MDH_dataExplorer with the required credentials.
-    getExplorerCredentials(secret_key, service_account, project_id)
-
-    # Also add some of the other fields needed to make the connection from the enviroment
-    # variables.
-    org_id = service_account.split(".")[1]
-    schema_name = "mdh_export_database_rk_{}_{}_prod".format(
-        org_id.lower(), project_name
-    )
-    s3_location = "s3://pep-mdh-export-database-prod/execution/rk_{}_{}".format(
-        org_id.lower(), project_name.lower()
-    )
-    MDH_dataExplorer["region"] = os.getenv("MDH_REGION", "us-east-1")
-    MDH_dataExplorer["schema_name"] = schema_name
-    MDH_dataExplorer["s3_output"] = s3_location
-else:
-    print("Normal superset mode.")
-
 # ========================================
-# Redis Configuration for Production
+# Redis Configuration
 # ========================================
 
-# Redis configuration
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_HOST = os.getenv("REDIS_HOST", None)
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 

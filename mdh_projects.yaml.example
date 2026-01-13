@@ -1,0 +1,33 @@
+# MDH Projects Configuration (YAML Format)
+# Alternative to JSON configuration in .env file
+# Copy this to mdh_projects.yaml and configure your projects
+
+projects:
+  # First project
+  project_1:
+    account_name: ""
+    secret: "" # Base64 encoded MDH private key
+    project_id: ""
+    schema: ""
+    s3_output: ""
+    region: "us-east-1"
+    workgroup: "mdh_export_database_external_prod"
+    catalog: "AwsDataCatalog"
+  
+  # Additional projects can be added here
+  # project_2:
+  #   account_name: ""
+  #   secret: ""
+  #   project_id: ""
+  #   schema: ""
+  #   s3_output: "s3://staging-bucket/athena-results/"
+  #   region: "us-west-2"
+
+# Usage:
+# 1. Copy this file to mdh_projects.yaml
+# 2. Replace example values with your actual configuration
+# 3. Encode your private keys: cat your_key.pem | base64 -w 0
+# 4. Create database connections in Superset with hostnames like: mdh-yogamm
+
+# Note: This is an alternative to the JSON configuration in .env
+# The system will use JSON from .env if available, otherwise YAML

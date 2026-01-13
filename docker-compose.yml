@@ -32,6 +32,7 @@ services:
       - REDIS_DB=0
     volumes:
       - superset_data:/app/superset_home
+      - ./mdh_projects.yaml:/app/mdh_projects.yaml:ro
     depends_on:
       redis:
         condition: service_healthy
