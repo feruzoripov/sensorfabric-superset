@@ -1,4 +1,4 @@
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 from sensorfabric.mdh import MDH
 from sensorfabric import utils
 import re
@@ -137,35 +137,18 @@ def load_mdh_projects():
 
 def get_project_from_uri(uri_str):
     """Extract project ID from database URI"""
+    # MDH uri come with the hostnmae "mdh.athena.com".
+    # If we do not find that we just return for normal processing.
+    hostname = urlparse(uri_str).hostname
+    if not hostname == 'mdh.athena.com':
+        return None
+
     # Check for query parameter
     if '?mdh_project=' in uri_str:
         try:
             return uri_str.split('?mdh_project=')[1].split('&')[0]
         except:
             pass
-
-    # Check hostname patterns
-    if 'mdh-' in uri_str:
-        try:
-            start = uri_str.find('mdh-') + 4
-            end_markers = ['.', ':', '/', '?']
-            end = len(uri_str)
-            for marker in end_markers:
-                marker_pos = uri_str.find(marker, start)
-                if marker_pos != -1:
-                    end = min(end, marker_pos)
-            return uri_str[start:end]
-        except:
-            pass
-
-    # Check if URI contains any configured project names
-    for project_alias in MDH_PROJECTS.keys():
-        if project_alias in uri_str:
-            return project_alias
-
-    # If only one project configured, use it
-    if len(MDH_PROJECTS) == 1:
-        return list(MDH_PROJECTS.keys())[0]
 
     return None
 
