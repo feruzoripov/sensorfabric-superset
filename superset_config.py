@@ -274,54 +274,135 @@ file_handler = RotatingFileHandler(
 file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 
-# ---- Read blocked tables from env ----
-# Example in .env:
-# BLOCKED_TABLES=raw.pii_users, finance.payments_ledger, secret_table
+# ---- Access control configuration from env ----
+
+# Fully blocked tables (no access at all unless ALLOWED_COLUMNS grants exceptions)
 BLOCKED_TABLES = {
     t.strip()
     for t in os.getenv("BLOCKED_TABLES", "").split(",")
     if t.strip()
 }
 
-def _compile_block_patterns(blocked: set[str]) -> list[re.Pattern]:
-    """
-    Compile regexes that match quoted/unquoted, schema-qualified or plain names.
-    """
-    patterns: list[re.Pattern] = []
-    for name in blocked:
-        parts = name.split(".")
-        if len(parts) == 2:
-            schema, table = map(re.escape, parts)
-            # e.g. raw.pii_users (with optional quotes/whitespace)
-            pat = rf'(?i)(?<![\w"])("?\b{schema}\b"?\s*\.\s*"?\b{table}\b"?)'
-        else:
-            table = re.escape(parts[0])
-            pat = rf'(?i)(?<![\w"])("?\b{table}\b"?)'
-        patterns.append(re.compile(pat))
-    return patterns
+# Columns allowed from blocked tables (table.column format)
+# e.g. "allparticipants.customfields" allows SELECT customfields FROM allparticipants
+ALLOWED_COLUMNS = {}
+for entry in os.getenv("ALLOWED_COLUMNS", "").split(","):
+    entry = entry.strip()
+    if "." in entry:
+        table, column = entry.split(".", 1)
+        ALLOWED_COLUMNS.setdefault(table.strip().lower(), set()).add(column.strip().lower())
 
-_BLOCK_PATTERNS = _compile_block_patterns(BLOCKED_TABLES)
+# Blocked fields within allowed columns
+# These field names will be blocked if they appear in queries against allowed columns
+BLOCKED_FIELDS = {
+    f.strip().lower()
+    for f in os.getenv("BLOCKED_FIELDS", "").split(",")
+    if f.strip()
+}
+
 
 def _strip_sql_comments(sql: str) -> str:
-    # Remove /* ... */ and -- ... to avoid matches in comments
+    """Remove SQL comments to avoid false matches"""
     sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
     sql = re.sub(r"--[^\n]*", " ", sql)
     return sql
 
+
+def _query_references_table(sql_lower: str, table: str) -> bool:
+    """Check if SQL references a specific table"""
+    table_escaped = re.escape(table.lower())
+    pattern = rf'(?:from|join|update|into|delete\s+from)\s+["`]?{table_escaped}["`]?(?:\s|$|,|;)'
+    return bool(re.search(pattern, sql_lower))
+
+
+def _query_uses_star_on_table(sql_lower: str, table: str) -> bool:
+    """Check if query uses SELECT * on a specific table"""
+    # Match SELECT * or table.* patterns
+    if re.search(r'\bselect\s+\*\s+from\b', sql_lower):
+        return True
+    table_escaped = re.escape(table.lower())
+    if re.search(rf'\b{table_escaped}\s*\.\s*\*', sql_lower):
+        return True
+    return False
+
+
+def _get_selected_columns(sql_lower: str) -> set:
+    """Extract column names from SELECT clause"""
+    match = re.search(r'select\s+(.*?)\s+from\b', sql_lower, re.S)
+    if not match:
+        return set()
+    
+    select_clause = match.group(1)
+    columns = set()
+    for col in select_clause.split(","):
+        col = col.strip()
+        # Handle table.column format
+        if "." in col:
+            col = col.split(".")[-1]
+        # Handle aliases (column AS alias)
+        if " as " in col:
+            col = col.split(" as ")[0].strip()
+        # Remove quotes
+        col = col.strip('"`')
+        columns.add(col.lower())
+    
+    return columns
+
+
 def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
     """
-    Blocks queries that reference any table in BLOCKED_TABLES.
+    Access control for SQL queries:
+    1. Block queries to BLOCKED_TABLES unless only querying ALLOWED_COLUMNS
+    2. Block SELECT * on restricted tables
+    3. Block queries that reference BLOCKED_FIELDS
     """
     cleaned = _strip_sql_comments(sql)
-
-    for pat in _BLOCK_PATTERNS:
-        if pat.search(cleaned):
+    sql_lower = cleaned.lower()
+    
+    # Check each blocked table
+    for table in BLOCKED_TABLES:
+        if not _query_references_table(sql_lower, table):
+            continue
+        
+        table_lower = table.lower()
+        
+        # If table has no allowed columns, block entirely
+        if table_lower not in ALLOWED_COLUMNS:
             raise Exception(
-                "This query references a restricted table and cannot be executed. "
-                "If you believe you need access, contact the data admin."
+                f"Access denied: Table '{table}' is restricted. "
+                "Contact the data admin if you need access."
             )
-
+        
+        # Block SELECT * on restricted tables
+        if _query_uses_star_on_table(sql_lower, table):
+            allowed = ", ".join(sorted(ALLOWED_COLUMNS[table_lower]))
+            raise Exception(
+                f"Access denied: SELECT * is not allowed on '{table}'. "
+                f"You may only query these columns: {allowed}"
+            )
+        
+        # Check that only allowed columns are being selected
+        selected_columns = _get_selected_columns(sql_lower)
+        allowed_cols = ALLOWED_COLUMNS[table_lower]
+        
+        for col in selected_columns:
+            if col not in allowed_cols and col != "*":
+                raise Exception(
+                    f"Access denied: Column '{col}' is not accessible on '{table}'. "
+                    f"Allowed columns: {', '.join(sorted(allowed_cols))}"
+                )
+    
+    # Check for blocked fields in the entire query
+    for field in BLOCKED_FIELDS:
+        field_pattern = rf'\b{re.escape(field)}\b'
+        if re.search(field_pattern, sql_lower):
+            raise Exception(
+                f"Access denied: Queries referencing '{field}' are not allowed. "
+                "Contact the data admin if you need access."
+            )
+    
     dttm = datetime.now().isoformat()
     return f"-- [SQL LAB] {dttm}\n{sql}"
 
 SQL_QUERY_MUTATOR = SQL_QUERY_MUTATOR
+
