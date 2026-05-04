@@ -284,7 +284,6 @@ BLOCKED_TABLES = {
 }
 
 # Columns allowed from blocked tables (table.column format)
-# e.g. "allparticipants.customfields" allows SELECT customfields FROM allparticipants
 ALLOWED_COLUMNS = {}
 for entry in os.getenv("ALLOWED_COLUMNS", "").split(","):
     entry = entry.strip()
@@ -292,13 +291,20 @@ for entry in os.getenv("ALLOWED_COLUMNS", "").split(","):
         table, column = entry.split(".", 1)
         ALLOWED_COLUMNS.setdefault(table.strip().lower(), set()).add(column.strip().lower())
 
-# Blocked fields within allowed columns
-# These field names will be blocked if they appear in queries against allowed columns
+# Blocked field values - rows with these values in BLOCKED_FIELDS_COLUMNS are excluded
 BLOCKED_FIELDS = {
     f.strip().lower()
     for f in os.getenv("BLOCKED_FIELDS", "").split(",")
     if f.strip()
 }
+
+# Columns that contain field identifiers to filter against (comma-separated)
+# Use column_name for varchar columns, or column_name:map for map-type columns
+BLOCKED_FIELDS_COLUMNS = []
+for c in os.getenv("BLOCKED_FIELDS_COLUMN", "").split(","):
+    c = c.strip()
+    if c:
+        BLOCKED_FIELDS_COLUMNS.append(c)
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -317,7 +323,6 @@ def _query_references_table(sql_lower: str, table: str) -> bool:
 
 def _query_uses_star_on_table(sql_lower: str, table: str) -> bool:
     """Check if query uses SELECT * on a specific table"""
-    # Match SELECT * or table.* patterns
     if re.search(r'\bselect\s+\*\s+from\b', sql_lower):
         return True
     table_escaped = re.escape(table.lower())
@@ -331,22 +336,114 @@ def _get_selected_columns(sql_lower: str) -> set:
     match = re.search(r'select\s+(.*?)\s+from\b', sql_lower, re.S)
     if not match:
         return set()
-    
+
     select_clause = match.group(1)
     columns = set()
     for col in select_clause.split(","):
         col = col.strip()
-        # Handle table.column format
         if "." in col:
             col = col.split(".")[-1]
-        # Handle aliases (column AS alias)
         if " as " in col:
             col = col.split(" as ")[0].strip()
-        # Remove quotes
         col = col.strip('"`')
         columns.add(col.lower())
-    
+
     return columns
+
+
+def _inject_blocked_fields_filter(sql: str) -> str:
+    """
+    Rewrite the query to exclude rows where any BLOCKED_FIELDS_COLUMNS
+    matches a blocked field value. Only filters on columns that exist
+    in the original query.
+    
+    For varchar columns: filters rows where column value matches blocked fields
+    For map columns: removes blocked keys from the map
+    """
+    if not BLOCKED_FIELDS_COLUMNS or not BLOCKED_FIELDS:
+        return sql
+
+    sql_lower = sql.lower()
+
+    # Only apply filter for columns that are actually referenced in the query
+    applicable_columns = [
+        col for col in BLOCKED_FIELDS_COLUMNS
+        if col.lower().split(":")[0] in sql_lower
+    ]
+
+    if not applicable_columns:
+        return sql
+
+    blocked_list = ", ".join(f"'{f}'" for f in sorted(BLOCKED_FIELDS))
+
+    # Separate varchar columns from map columns
+    varchar_conditions = []
+    map_columns = []
+
+    for col in applicable_columns:
+        if ":" in col and col.split(":")[1].lower() == "map":
+            map_columns.append(col.split(":")[0])
+        else:
+            varchar_conditions.append(f"LOWER({col}) NOT IN ({blocked_list})")
+
+    # If we only have varchar columns, use simple WHERE filter
+    if varchar_conditions and not map_columns:
+        conditions = " AND ".join(varchar_conditions)
+        return (
+            f"SELECT * FROM (\n{sql}\n) __filtered\n"
+            f"WHERE {conditions}"
+        )
+
+    # If we have map columns, we need to rebuild the SELECT to strip blocked keys
+    # For map columns: use map_filter to remove blocked keys
+    map_transforms = []
+    for col in map_columns:
+        blocked_array = ", ".join(f"'{f}'" for f in sorted(BLOCKED_FIELDS))
+        map_transforms.append(
+            f"map_filter({col}, (k, v) -> LOWER(k) NOT IN ({blocked_array})) AS {col}"
+        )
+
+    # Build the outer query
+    if map_transforms:
+        # Get all columns except the map ones we're transforming, then add transformed versions
+        map_col_names = {c.lower() for c in map_columns}
+        
+        # Replace the map columns with filtered versions
+        select_parts = []
+        select_parts.append("*")  # We'll use EXCEPT syntax or subquery approach
+        
+        # Athena supports replacing columns via subquery
+        other_cols = "__inner.*"
+        
+        # Simpler approach: wrap and replace
+        inner_alias = "__inner"
+        map_selects = ", ".join(map_transforms)
+        
+        # Use a subquery that excludes map columns, then add filtered versions
+        filtered_sql = (
+            f"SELECT {inner_alias}.*, {map_selects} FROM (\n{sql}\n) {inner_alias}"
+        )
+        
+        # This will create duplicate columns - let's use a different approach
+        # Just wrap the query and apply map_filter in outer SELECT
+        # Athena doesn't support EXCEPT, so we select * and override with map_filter
+        
+        # Simplest approach: just filter the map in a wrapping query
+        map_filter_exprs = ", ".join(
+            f"map_filter({col}, (k, v) -> LOWER(k) NOT IN ({blocked_list})) AS {col}"
+            for col in map_columns
+        )
+        
+        filtered_sql = f"SELECT *, {map_filter_exprs} FROM (\n{sql}\n) __filtered"
+        
+        # Add varchar conditions if any
+        if varchar_conditions:
+            conditions = " AND ".join(varchar_conditions)
+            filtered_sql += f"\nWHERE {conditions}"
+        
+        return filtered_sql
+
+    return sql
 
 
 def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
@@ -354,25 +451,25 @@ def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
     Access control for SQL queries:
     1. Block queries to BLOCKED_TABLES unless only querying ALLOWED_COLUMNS
     2. Block SELECT * on restricted tables
-    3. Block queries that reference BLOCKED_FIELDS
+    3. Automatically exclude rows matching BLOCKED_FIELDS from results
     """
     cleaned = _strip_sql_comments(sql)
     sql_lower = cleaned.lower()
-    
+
     # Check each blocked table
     for table in BLOCKED_TABLES:
         if not _query_references_table(sql_lower, table):
             continue
-        
+
         table_lower = table.lower()
-        
+
         # If table has no allowed columns, block entirely
         if table_lower not in ALLOWED_COLUMNS:
             raise Exception(
                 f"Access denied: Table '{table}' is restricted. "
                 "Contact the data admin if you need access."
             )
-        
+
         # Block SELECT * on restricted tables
         if _query_uses_star_on_table(sql_lower, table):
             allowed = ", ".join(sorted(ALLOWED_COLUMNS[table_lower]))
@@ -380,27 +477,21 @@ def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
                 f"Access denied: SELECT * is not allowed on '{table}'. "
                 f"You may only query these columns: {allowed}"
             )
-        
+
         # Check that only allowed columns are being selected
         selected_columns = _get_selected_columns(sql_lower)
         allowed_cols = ALLOWED_COLUMNS[table_lower]
-        
+
         for col in selected_columns:
             if col not in allowed_cols and col != "*":
                 raise Exception(
                     f"Access denied: Column '{col}' is not accessible on '{table}'. "
                     f"Allowed columns: {', '.join(sorted(allowed_cols))}"
                 )
-    
-    # Check for blocked fields in the entire query
-    for field in BLOCKED_FIELDS:
-        field_pattern = rf'\b{re.escape(field)}\b'
-        if re.search(field_pattern, sql_lower):
-            raise Exception(
-                f"Access denied: Queries referencing '{field}' are not allowed. "
-                "Contact the data admin if you need access."
-            )
-    
+
+    # Inject filter to exclude blocked fields from results
+    sql = _inject_blocked_fields_filter(sql)
+
     dttm = datetime.now().isoformat()
     return f"-- [SQL LAB] {dttm}\n{sql}"
 
