@@ -357,93 +357,55 @@ def _inject_blocked_fields_filter(sql: str) -> str:
     matches a blocked field value. Only filters on columns that exist
     in the original query.
     
-    For varchar columns: filters rows where column value matches blocked fields
-    For map columns: removes blocked keys from the map
+    For varchar columns: wraps query and filters rows by column value
+    For map columns: blocks queries that try to extract blocked keys
     """
     if not BLOCKED_FIELDS_COLUMNS or not BLOCKED_FIELDS:
         return sql
 
     sql_lower = sql.lower()
 
-    # Only apply filter for columns that are actually referenced in the query
-    applicable_columns = [
+    # Check map columns - block queries that try to extract blocked keys
+    for col in BLOCKED_FIELDS_COLUMNS:
+        if ":" in col and col.split(":")[1].lower() == "map":
+            col_name = col.split(":")[0]
+            if col_name.lower() not in sql_lower:
+                continue
+            # Check if any blocked field is referenced as a JSON path or map key
+            for field in BLOCKED_FIELDS:
+                # Match patterns like $.field_name, ['field_name'], or element_at(map, 'field_name')
+                patterns = [
+                    rf"\$\.{re.escape(field)}\b",
+                    rf"\['{re.escape(field)}'\]",
+                    rf"element_at\s*\([^,]*,\s*'{re.escape(field)}'",
+                ]
+                for pattern in patterns:
+                    if re.search(pattern, sql_lower):
+                        raise Exception(
+                            f"Access denied: Field '{field}' is restricted and cannot be accessed."
+                        )
+
+    # Apply varchar column filters
+    varchar_columns = [
         col for col in BLOCKED_FIELDS_COLUMNS
-        if col.lower().split(":")[0] in sql_lower
+        if ":" not in col and col.lower() in sql_lower
     ]
 
-    if not applicable_columns:
+    if not varchar_columns:
         return sql
 
     blocked_list = ", ".join(f"'{f}'" for f in sorted(BLOCKED_FIELDS))
+    conditions = " AND ".join(
+        f"LOWER({col}) NOT IN ({blocked_list})"
+        for col in varchar_columns
+    )
 
-    # Separate varchar columns from map columns
-    varchar_conditions = []
-    map_columns = []
+    filtered_sql = (
+        f"SELECT * FROM (\n{sql}\n) __filtered\n"
+        f"WHERE {conditions}"
+    )
 
-    for col in applicable_columns:
-        if ":" in col and col.split(":")[1].lower() == "map":
-            map_columns.append(col.split(":")[0])
-        else:
-            varchar_conditions.append(f"LOWER({col}) NOT IN ({blocked_list})")
-
-    # If we only have varchar columns, use simple WHERE filter
-    if varchar_conditions and not map_columns:
-        conditions = " AND ".join(varchar_conditions)
-        return (
-            f"SELECT * FROM (\n{sql}\n) __filtered\n"
-            f"WHERE {conditions}"
-        )
-
-    # If we have map columns, we need to rebuild the SELECT to strip blocked keys
-    # For map columns: use map_filter to remove blocked keys
-    map_transforms = []
-    for col in map_columns:
-        blocked_array = ", ".join(f"'{f}'" for f in sorted(BLOCKED_FIELDS))
-        map_transforms.append(
-            f"map_filter({col}, (k, v) -> LOWER(k) NOT IN ({blocked_array})) AS {col}"
-        )
-
-    # Build the outer query
-    if map_transforms:
-        # Get all columns except the map ones we're transforming, then add transformed versions
-        map_col_names = {c.lower() for c in map_columns}
-        
-        # Replace the map columns with filtered versions
-        select_parts = []
-        select_parts.append("*")  # We'll use EXCEPT syntax or subquery approach
-        
-        # Athena supports replacing columns via subquery
-        other_cols = "__inner.*"
-        
-        # Simpler approach: wrap and replace
-        inner_alias = "__inner"
-        map_selects = ", ".join(map_transforms)
-        
-        # Use a subquery that excludes map columns, then add filtered versions
-        filtered_sql = (
-            f"SELECT {inner_alias}.*, {map_selects} FROM (\n{sql}\n) {inner_alias}"
-        )
-        
-        # This will create duplicate columns - let's use a different approach
-        # Just wrap the query and apply map_filter in outer SELECT
-        # Athena doesn't support EXCEPT, so we select * and override with map_filter
-        
-        # Simplest approach: just filter the map in a wrapping query
-        map_filter_exprs = ", ".join(
-            f"map_filter({col}, (k, v) -> LOWER(k) NOT IN ({blocked_list})) AS {col}"
-            for col in map_columns
-        )
-        
-        filtered_sql = f"SELECT *, {map_filter_exprs} FROM (\n{sql}\n) __filtered"
-        
-        # Add varchar conditions if any
-        if varchar_conditions:
-            conditions = " AND ".join(varchar_conditions)
-            filtered_sql += f"\nWHERE {conditions}"
-        
-        return filtered_sql
-
-    return sql
+    return filtered_sql
 
 
 def SQL_QUERY_MUTATOR(sql: str, **kwargs) -> str:
