@@ -369,7 +369,7 @@ def _inject_blocked_fields_filter(sql: str) -> str:
     for col in BLOCKED_FIELDS_COLUMNS:
         if ":" in col and col.split(":")[1].lower() == "map":
             col_name = col.split(":")[0]
-            if col_name.lower() not in sql_lower:
+            if not re.search(rf'\b{re.escape(col_name.lower())}\b', sql_lower):
                 continue
             # Check if any blocked field is referenced as a JSON path or map key
             for field in BLOCKED_FIELDS:
@@ -385,11 +385,31 @@ def _inject_blocked_fields_filter(sql: str) -> str:
                             f"Access denied: Field '{field}' is restricted and cannot be accessed."
                         )
 
-    # Apply varchar column filters
-    varchar_columns = [
-        col for col in BLOCKED_FIELDS_COLUMNS
-        if ":" not in col and col.lower() in sql_lower
-    ]
+    # Apply varchar column filters - only when the column appears in the final SELECT output
+    varchar_columns = []
+    for col in BLOCKED_FIELDS_COLUMNS:
+        if ":" in col:
+            continue
+        col_lower = col.lower()
+        # Check if column is in the outermost SELECT clause (not just referenced in WHERE/JOIN)
+        # Find the last SELECT statement (the final output)
+        # For CTEs, the final SELECT is after the last closing paren or the main SELECT
+        final_select = sql_lower
+        # Try to find the final SELECT (after WITH ... AS (...))
+        # Simple heuristic: find the last SELECT that's not inside a CTE
+        last_select_pos = sql_lower.rfind('\nselect')
+        if last_select_pos == -1:
+            last_select_pos = sql_lower.rfind('select')
+        if last_select_pos >= 0:
+            final_select = sql_lower[last_select_pos:]
+        
+        # Check if the column is in the final SELECT's FROM clause as a table/source
+        # Only apply filter if the column is selected as output in the final query
+        final_from_match = re.search(r'select\s+(.*?)\s+from\b', final_select, re.S)
+        if final_from_match:
+            final_select_clause = final_from_match.group(1)
+            if re.search(rf'\b{re.escape(col_lower)}\b', final_select_clause):
+                varchar_columns.append(col)
 
     if not varchar_columns:
         return sql
