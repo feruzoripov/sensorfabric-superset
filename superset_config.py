@@ -175,16 +175,7 @@ DB_CONNECTION_MUTATOR = custom_db_connector_mutator
 # Superset Configuration
 # ========================================
 
-ROW_LIMIT = 0
-SQL_MAX_ROW = 0  # No server-side maximum
-SQLLAB_DEFAULT_DBID = None
-
-# Default row limit shown in SQL Lab dropdown
-DEFAULT_SQLLAB_LIMIT = 1000
-
-# Options available in the SQL Lab row limit dropdown
-SQLLAB_ROW_LIMITS = [10, 100, 1000, 5000, 10000, 50000, 100000, 1000000]
-
+ROW_LIMIT = 100000
 PREFERRED_DATABASES = ["Amazon Athena"]
 
 SECRET_KEY = os.environ.get("SECRET_KEY")
